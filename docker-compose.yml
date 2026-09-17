@@ -1,0 +1,8 @@
+services:
+  subnet-planner:
+    build: .
+    image: ipv4-subnet-planner
+    container_name: ipv4-subnet-planner
+    ports:
+      - "8080:80"
+    restart: unless-stopped
