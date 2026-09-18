@@ -562,3 +562,37 @@ tr.policy-permit td {
   max-width: 80vw;
   white-space: pre-wrap;
 }
+
+/* ---- 协同冲突 ---- */
+.conflict-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+@media (max-width: 640px) {
+  .conflict-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.conflict-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conflict-side h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.conflict-side p {
+  margin: 0;
+  flex: 1;
+}
+
+.conflict-side .btn {
+  margin-top: 4px;
+}

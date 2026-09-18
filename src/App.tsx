@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Allocation,
   Plan,
@@ -16,6 +16,21 @@ import {
   findLowestSlot,
   planMigration,
 } from './lib/planner';
+import {
+  CHANNEL_NAME,
+  Revision,
+  RevisionStore,
+  advanceHead,
+  classifyRemote,
+  clearStored,
+  getClientId,
+  isAncestor,
+  makeRevision,
+  persistRevision,
+  restoreHead,
+  storeRevision,
+  validateRevision,
+} from './lib/sync';
 import { cidrToString, parseCidr, prefixForHosts } from './lib/ip';
 import Toolbar from './components/Toolbar';
 import RootsPanel from './components/RootsPanel';
@@ -24,12 +39,19 @@ import AllocationsPanel from './components/AllocationsPanel';
 import NewAllocationForm from './components/NewAllocationForm';
 import MigrationModal from './components/MigrationModal';
 import PrefixPolicyModal from './components/PrefixPolicyModal';
+import ConflictModal from './components/ConflictModal';
 
 interface MigrationRequest {
   title: string;
   plan: MigrationPlan;
   /** 确认后整批原子应用的下一个规划 */
   next: Plan;
+}
+
+/** 未解决的协同冲突：本页 head 与外部分叉版本各执一份 */
+interface ConflictState {
+  local: Revision;
+  remote: Revision;
 }
 
 function demoPlan(): Plan {
@@ -60,44 +82,194 @@ function demoPlan(): Plan {
 }
 
 export default function App() {
-  const [plan, setPlan] = useState<Plan>(emptyPlan);
+  const [clientId] = useState(getClientId);
+  /** 启动时从 localStorage 恢复 head 指向的 revision（损坏则忽略并提示） */
+  const [restore] = useState(restoreHead);
+  const [plan, setPlan] = useState<Plan>(() => {
+    if (restore.corrupt || !restore.store.headId) return emptyPlan();
+    return restore.store.revisions.get(restore.store.headId)!.plan;
+  });
   const [past, setPast] = useState<Plan[]>([]);
   const [future, setFuture] = useState<Plan[]>([]);
   const [migration, setMigration] = useState<MigrationRequest | null>(null);
   const [resizeTarget, setResizeTarget] = useState<Allocation | null>(null);
   const [prefixPolicyOpen, setPrefixPolicyOpen] = useState(false);
+  const [conflict, setConflict] = useState<ConflictState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  const storeRef = useRef<RevisionStore>(
+    restore.corrupt ? { revisions: new Map(), headId: null } : restore.store,
+  );
+  const headRef = useRef<string | null>(restore.corrupt ? null : restore.store.headId);
+  const planRef = useRef(plan);
+  const conflictRef = useRef(conflict);
+  const channelRef = useRef<BroadcastChannel | null>(null);
+
+  useEffect(() => {
+    planRef.current = plan;
+  }, [plan]);
+  useEffect(() => {
+    conflictRef.current = conflict;
+  }, [conflict]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 5000);
   }, []);
 
-  /** 所有状态变更的唯一入口：记录历史、清空重做栈 */
-  const commit = useCallback(
+  /** 损坏快照：忽略并清除，避免每次启动重复提示 */
+  useEffect(() => {
+    if (restore.corrupt) {
+      clearStored();
+      showToast('本地快照已损坏，已忽略并从空白规划开始');
+    }
+  }, [restore.corrupt, showToast]);
+
+  /** 本地变更发布为 revision：入库、更新 head、广播（撤销/重做/导入/清空同走此路） */
+  const publish = useCallback(
     (next: Plan) => {
+      const rev = makeRevision(headRef.current ? [headRef.current] : [], clientId, next);
+      try {
+        persistRevision(storeRef.current, rev);
+      } catch {
+        showToast('本地持久化失败：浏览器存储不可用或已满');
+      }
+      headRef.current = rev.id;
+      channelRef.current?.postMessage({ type: 'revision', revision: rev });
+    },
+    [clientId, showToast],
+  );
+
+  /** 处理其他标签页广播来的 revision：按修订图决定快进 / 忽略 / 冲突 */
+  const handleRemote = useCallback(
+    (rev: Revision) => {
+      const store = storeRef.current;
+      if (store.revisions.has(rev.id)) return; // 已处理过的重复消息
+      try {
+        storeRevision(store, rev); // 先入库，保证修订图完整（不移动本地 head）
+      } catch {
+        showToast('本地持久化失败：浏览器存储不可用或已满');
+      }
+      const head = headRef.current;
+      const verdict = classifyRemote(store.revisions, head, rev.id);
+      if (verdict === 'fast-forward') {
+        // 当前版本是其祖先：自动快进，并作为一次可撤销变更
+        setPast((p) => [...p, planRef.current]);
+        setFuture([]);
+        setPlan(rev.plan);
+        headRef.current = rev.id;
+        try {
+          advanceHead(store, rev.id);
+        } catch {
+          /* head 指针发送方已写入，本地写失败不影响同步 */
+        }
+        // 若该 revision 已合并冲突对方（其他标签页先解决了冲突），自动关闭冲突弹窗
+        const c = conflictRef.current;
+        if (c && isAncestor(store.revisions, c.remote.id, rev.id)) setConflict(null);
+        showToast('已同步其他标签页的修改');
+      } else if (verdict === 'stale') {
+        // 外部版本是当前版本的祖先：过期消息，忽略
+      } else if (!conflictRef.current) {
+        // 双方互不为祖先：保留两份并弹窗，绝不按时间戳覆盖
+        const local = head ? store.revisions.get(head) : undefined;
+        if (local) setConflict({ local, remote: rev });
+      }
+      // 已有冲突在审时：保留首个冲突；新 revision 已入库，解决后按图继续收敛
+    },
+    [showToast],
+  );
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const ch = new BroadcastChannel(CHANNEL_NAME);
+    channelRef.current = ch;
+    ch.onmessage = (e: MessageEvent) => {
+      const data = e.data as { type?: unknown; revision?: unknown } | null;
+      if (!data || data.type !== 'revision') return;
+      const errors = validateRevision(data.revision);
+      if (errors.length > 0) {
+        showToast('收到损坏的协同快照，已忽略');
+        return;
+      }
+      handleRemote(data.revision as Revision);
+    };
+    return () => {
+      ch.close();
+      channelRef.current = null;
+    };
+  }, [handleRemote, showToast]);
+
+  /** 冲突解决：生成同时引用两个版本的合并 revision 并继续广播 */
+  const resolveConflict = useCallback(
+    (choice: 'keep' | 'adopt') => {
+      const c = conflictRef.current;
+      if (!c) return;
+      const next = choice === 'keep' ? planRef.current : c.remote.plan;
+      const merge = makeRevision([headRef.current ?? c.local.id, c.remote.id], clientId, next);
+      try {
+        persistRevision(storeRef.current, merge);
+      } catch {
+        showToast('本地持久化失败：浏览器存储不可用或已满');
+      }
+      headRef.current = merge.id;
+      channelRef.current?.postMessage({ type: 'revision', revision: merge });
+      if (choice === 'adopt') {
+        // 采用外部：Plan 发生变化，作为一次可撤销变更
+        setPast((p) => [...p, planRef.current]);
+        setFuture([]);
+        setPlan(c.remote.plan);
+      }
+      setConflict(null);
+      showToast(
+        choice === 'keep'
+          ? '已保留本页内容，合并 revision 已广播'
+          : '已采用外部版本，合并 revision 已广播',
+      );
+    },
+    [clientId, showToast],
+  );
+
+  /** 所有状态变更的唯一入口：记录历史、清空重做栈、发布 revision。冲突期间拒绝并返回 false */
+  const commit = useCallback(
+    (next: Plan): boolean => {
+      if (conflictRef.current) {
+        showToast('存在未解决的协同冲突，请先在弹窗中处理');
+        return false;
+      }
       setPast((p) => [...p, plan]);
       setFuture([]);
       setPlan(next);
+      publish(next);
+      return true;
     },
-    [plan],
+    [plan, publish, showToast],
   );
 
   const undo = useCallback(() => {
+    if (conflictRef.current) {
+      showToast('存在未解决的协同冲突，请先在弹窗中处理');
+      return;
+    }
     if (past.length === 0) return;
     const prev = past[past.length - 1];
     setPast(past.slice(0, -1));
     setFuture((f) => [plan, ...f]);
     setPlan(prev);
-  }, [past, plan]);
+    publish(prev);
+  }, [past, plan, publish, showToast]);
 
   const redo = useCallback(() => {
+    if (conflictRef.current) {
+      showToast('存在未解决的协同冲突，请先在弹窗中处理');
+      return;
+    }
     if (future.length === 0) return;
     const next = future[0];
     setFuture(future.slice(1));
     setPast((p) => [...p, plan]);
     setPlan(next);
-  }, [future, plan]);
+    publish(next);
+  }, [future, plan, publish, showToast]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -127,8 +299,7 @@ export default function App() {
         allocations: applyMigration(nextAllocs, mig),
       };
       if (mig.ok && mig.items.every((i) => i.status === 'kept')) {
-        commit(next);
-        showToast('已应用：所有分配均可原位保留');
+        if (commit(next)) showToast('已应用：所有分配均可原位保留');
       } else {
         setMigration({ title, plan: mig, next });
       }
@@ -234,8 +405,9 @@ export default function App() {
 
   const releaseAllocation = useCallback(
     (id: string) => {
-      commit({ ...plan, allocations: plan.allocations.filter((a) => a.id !== id) });
-      showToast('已释放，相邻空闲伙伴块已自动合并');
+      if (commit({ ...plan, allocations: plan.allocations.filter((a) => a.id !== id) })) {
+        showToast('已释放，相邻空闲伙伴块已自动合并');
+      }
     },
     [plan, commit, showToast],
   );
@@ -274,8 +446,7 @@ export default function App() {
     (text: string) => {
       try {
         const imported = parsePlanJson(text);
-        commit(imported);
-        showToast('规划导入成功');
+        if (commit(imported)) showToast('规划导入成功');
       } catch (e) {
         showToast((e as Error).message);
       }
@@ -291,6 +462,7 @@ export default function App() {
       <Toolbar
         canUndo={past.length > 0}
         canRedo={future.length > 0}
+        editingDisabled={conflict !== null}
         onUndo={undo}
         onRedo={redo}
         onExport={exportPlan}
@@ -359,9 +531,10 @@ export default function App() {
           title={migration.title}
           plan={migration.plan}
           onConfirm={() => {
-            commit(migration.next);
-            setMigration(null);
-            showToast('迁移已整批原子应用');
+            if (commit(migration.next)) {
+              setMigration(null);
+              showToast('迁移已整批原子应用');
+            }
           }}
           onCancel={() => setMigration(null)}
         />
@@ -371,6 +544,14 @@ export default function App() {
         <PrefixPolicyModal
           allocations={plan.allocations}
           onClose={() => setPrefixPolicyOpen(false)}
+        />
+      )}
+
+      {conflict && (
+        <ConflictModal
+          local={conflict.local}
+          remote={conflict.remote}
+          onResolve={resolveConflict}
         />
       )}
     </div>

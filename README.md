@@ -1,8 +1,8 @@
 # IPv4 子网规划台
 
-一个纯本地的 IPv4 子网规划工具：在互不重叠的根网段中，以树形地址空间可视化管理命名保留段与子网分配，支持按主机数自动申请最小可用子网、迁移预演、撤销重做与规划 JSON 导入导出。
+一个纯本地的 IPv4 子网规划工具：在互不重叠的根网段中，以树形地址空间可视化管理命名保留段与子网分配，支持按主机数自动申请最小可用子网、迁移预演、撤销重做、规划 JSON 导入导出，以及本机多标签页协同编辑。
 
-技术栈：**React 18 + TypeScript + Vite + ipaddr.js**，无任何后端依赖，数据完全保存在浏览器内存中。
+技术栈：**React 18 + TypeScript + Vite + ipaddr.js**，无任何后端依赖；规划以 revision 形式持久化在浏览器 localStorage 中，并通过 BroadcastChannel 在同一浏览器的多个标签页间实时同步。
 
 ## 快速启动
 
@@ -26,7 +26,7 @@ npm run dev
 ### 其他命令
 
 ```bash
-npm test            # 运行规划引擎单元测试（vitest，63 项）
+npm test            # 运行规划引擎与协同单元测试（vitest，83 项）
 npm run build       # 类型检查 + 生产构建（输出 dist/）
 npm run preview     # 预览生产构建（http://localhost:4173）
 ```
@@ -92,6 +92,13 @@ npm run preview     # 预览生产构建（http://localhost:4173）
 - 工具栏按钮或快捷键：`Ctrl/Cmd+Z` 撤销，`Ctrl/Cmd+Shift+Z` 或 `Ctrl+Y` 重做；
 - 所有变更（含迁移、导入、清空）均进入历史栈。
 
+### 多标签页协同编辑
+- **revision 模型**：所有会改变 Plan 的操作（含撤销、重做、导入、清空）都发布为一条 revision——以 `crypto.randomUUID()` 生成 id，记录父 revision 链表（`parentIds`）、来源标签页 `clientId` 与完整 Plan 快照；
+- **本机持久化**：revision 存入 localStorage 并更新 head 指针后，通过 BroadcastChannel 广播给其他标签页；新打开的标签页自动恢复 head 指向且通过现有校验的 revision，刷新页面不丢数据；
+- **修订图同步**：收到外部 revision 时按祖先关系判定——当前版本是其祖先则**自动快进**（作为一次可撤销变更）；外部版本是当前版本的祖先则**忽略**；双方互不为祖先则**保留两份并弹出冲突窗口**，绝不按时间戳静默覆盖；
+- **冲突解决**：选择「保留本页」或「采用外部」后，生成同时引用两个版本的**合并 revision** 并继续广播，各标签页随之收敛；冲突未解决期间规划编辑（含撤销/重做/导入/清空）暂停，导出与前缀策略校验等只读操作不受影响；
+- **损坏快照**：无论启动恢复还是广播接收，未通过结构或 Plan 校验的快照一律忽略并提示。
+
 ### 导入 / 导出
 - **导出**：下载当前规划为 JSON 文件；
 - **导入**：选择 JSON 文件，完整校验（格式、对齐、根网段重叠、分配越界/重叠、容量一致性）通过后才替换当前规划，失败会列出全部错误；
@@ -110,13 +117,15 @@ npm run preview     # 预览生产构建（http://localhost:4173）
 │   │   ├── dhcp.ts         # DHCP 地址池：排除项解析校验、区间合并与扣除
 │   │   ├── prefixPolicy.ts # 前缀策略：prefix-list 规则解析、有序命中判定、文本报告
 │   │   ├── model.ts        # 数据模型、校验、JSON 导入导出
+│   │   ├── sync.ts         # 协同：revision 模型、localStorage 持久化、修订图祖先判断
 │   │   ├── planner.ts      # 最低可用地址分配、迁移预演、地址空间树
 │   │   ├── ip.test.ts      # 引擎单元测试
 │   │   ├── dhcp.test.ts
 │   │   ├── prefixPolicy.test.ts
+│   │   ├── sync.test.ts    # 协同单元测试（含双标签页流程模拟）
 │   │   └── planner.test.ts
-│   ├── components/         # 工具栏、根网段、树视图、分配清单、迁移预演/DHCP 池/前缀策略弹窗等
-│   ├── App.tsx             # 状态与历史栈（撤销/重做）、迁移流程编排
+│   ├── components/         # 工具栏、根网段、树视图、分配清单、迁移预演/DHCP 池/前缀策略/协同冲突弹窗等
+│   ├── App.tsx             # 状态与历史栈（撤销/重做）、迁移流程编排、revision 发布与同步
 │   └── main.tsx
 └── package.json
 ```

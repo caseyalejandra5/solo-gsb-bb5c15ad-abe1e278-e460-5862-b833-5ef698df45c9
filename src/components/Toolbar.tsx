@@ -3,6 +3,8 @@ import { useRef } from 'react';
 interface Props {
   canUndo: boolean;
   canRedo: boolean;
+  /** 协同冲突未解决时为 true：禁用一切会改变 Plan 的操作（导出/校验等只读操作除外） */
+  editingDisabled: boolean;
   onUndo: () => void;
   onRedo: () => void;
   onExport: () => void;
@@ -29,10 +31,20 @@ export default function Toolbar(props: Props) {
         <h1>IPv4 子网规划台</h1>
       </div>
       <div className="toolbar-actions">
-        <button className="btn" onClick={props.onUndo} disabled={!props.canUndo} title="Ctrl/Cmd+Z">
+        <button
+          className="btn"
+          onClick={props.onUndo}
+          disabled={!props.canUndo || props.editingDisabled}
+          title="Ctrl/Cmd+Z"
+        >
           ↩ 撤销
         </button>
-        <button className="btn" onClick={props.onRedo} disabled={!props.canRedo} title="Ctrl/Cmd+Shift+Z">
+        <button
+          className="btn"
+          onClick={props.onRedo}
+          disabled={!props.canRedo || props.editingDisabled}
+          title="Ctrl/Cmd+Shift+Z"
+        >
           ↪ 重做
         </button>
         <span className="divider" />
@@ -43,7 +55,7 @@ export default function Toolbar(props: Props) {
         <button className="btn" onClick={props.onExport}>
           导出 JSON
         </button>
-        <button className="btn" onClick={() => fileRef.current?.click()}>
+        <button className="btn" disabled={props.editingDisabled} onClick={() => fileRef.current?.click()}>
           导入 JSON
         </button>
         <input
@@ -54,11 +66,12 @@ export default function Toolbar(props: Props) {
           onChange={(e) => void handleFile(e.target.files?.[0])}
         />
         <span className="divider" />
-        <button className="btn" onClick={props.onLoadDemo}>
+        <button className="btn" disabled={props.editingDisabled} onClick={props.onLoadDemo}>
           载入示例
         </button>
         <button
           className="btn danger"
+          disabled={props.editingDisabled}
           onClick={() => {
             if (window.confirm('确定清空当前规划？（可撤销）')) props.onReset();
           }}
