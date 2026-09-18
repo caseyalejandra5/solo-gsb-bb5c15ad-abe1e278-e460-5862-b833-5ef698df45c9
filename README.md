@@ -2,7 +2,7 @@
 
 一个纯本地的 IPv4 子网规划工具：在互不重叠的根网段中，以树形地址空间可视化管理命名保留段与子网分配，支持按主机数自动申请最小可用子网、迁移预演、撤销重做与规划 JSON 导入导出。
 
-技术栈：**React 18 + TypeScript + Vite + ipaddr.js**，无任何后端依赖，数据完全保存在浏览器内存中。
+技术栈：**React 18 + TypeScript + Vite + ipaddr.js**，无任何后端依赖；规划以**修订图（revision graph）持久化在浏览器 localStorage**，并通过 **BroadcastChannel 在本机多个标签页之间协同编辑**。
 
 ## 快速启动
 
@@ -26,7 +26,7 @@ npm run dev
 ### 其他命令
 
 ```bash
-npm test            # 运行规划引擎单元测试（vitest，63 项）
+npm test            # 运行规划引擎与协同同步单元测试（vitest，82 项）
 npm run build       # 类型检查 + 生产构建（输出 dist/）
 npm run preview     # 预览生产构建（http://localhost:4173）
 ```
@@ -90,7 +90,18 @@ npm run preview     # 预览生产构建（http://localhost:4173）
 
 ### 撤销 / 重做
 - 工具栏按钮或快捷键：`Ctrl/Cmd+Z` 撤销，`Ctrl/Cmd+Shift+Z` 或 `Ctrl+Y` 重做；
-- 所有变更（含迁移、导入、清空）均进入历史栈。
+- 所有变更（含迁移、导入、清空、**撤销与重做本身**）均发布为一个新修订并进入历史栈。
+
+### 本机持久化与多标签页协同
+- 所有会改变 Plan 的操作都会生成一个**修订（revision）**：用 `crypto.randomUUID()` 生成 id，记录 `parentRevisionIds`、`clientId` 与**完整 Plan**，写入 `localStorage` 并更新 `head` 指针后通过 `BroadcastChannel` 广播；
+- 新标签页打开（或刷新）时恢复 `head` 指向、且通过现有规划校验的修订；`head` 损坏时自动恢复到最近的完整叶子修订；
+- 收到其他标签页的更新时**只按修订图的祖先关系**判定，绝不按时间戳覆盖：
+  - 当前版本是收到修订的**祖先** → 自动**快进**，并在本页记为**一次可撤销变更**；
+  - 收到修订是当前版本的**祖先**（过时/乱序更新）→ **忽略**；
+  - 双方互不为祖先（修订图分叉）→ **两份都保留**并弹窗冲突；
+- 冲突弹窗提供「**保留本页**」与「**采用外部**」：确认后生成一个**同时引用两个版本**的合并修订并继续广播，其他标签页收到后自动收敛；冲突期间**锁定一切规划编辑**（只读校验与导出仍可用），并挂起新到达的修订，合并后再统一重判（可能再次冲突）；
+- 修订快照（含广播与本地存储）结构损坏或未通过规划校验时**忽略该快照并提示**，不影响其他修订；
+- 空存储首次启动使用全局固定 id 的空规划创世修订，保证多个全新标签页自然收敛到同一节点。
 
 ### 导入 / 导出
 - **导出**：下载当前规划为 JSON 文件；
@@ -111,10 +122,12 @@ npm run preview     # 预览生产构建（http://localhost:4173）
 │   │   ├── prefixPolicy.ts # 前缀策略：prefix-list 规则解析、有序命中判定、文本报告
 │   │   ├── model.ts        # 数据模型、校验、JSON 导入导出
 │   │   ├── planner.ts      # 最低可用地址分配、迁移预演、地址空间树
+│   │   ├── revisionStore.ts # 修订图：localStorage 持久化、BroadcastChannel 同步、分叉/合并判定
 │   │   ├── ip.test.ts      # 引擎单元测试
 │   │   ├── dhcp.test.ts
 │   │   ├── prefixPolicy.test.ts
-│   │   └── planner.test.ts
+│   │   ├── planner.test.ts
+│   │   └── revisionStore.test.ts
 │   ├── components/         # 工具栏、根网段、树视图、分配清单、迁移预演/DHCP 池/前缀策略弹窗等
 │   ├── App.tsx             # 状态与历史栈（撤销/重做）、迁移流程编排
 │   └── main.tsx

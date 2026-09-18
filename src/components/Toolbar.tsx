@@ -3,6 +3,8 @@ import { useRef } from 'react';
 interface Props {
   canUndo: boolean;
   canRedo: boolean;
+  /** 多标签页分叉冲突解决期间锁定一切会修改规划的操作 */
+  locked?: boolean;
   onUndo: () => void;
   onRedo: () => void;
   onExport: () => void;
@@ -14,6 +16,7 @@ interface Props {
 
 export default function Toolbar(props: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const locked = props.locked ?? false;
 
   const handleFile = async (file: File | undefined) => {
     if (!file) return;
@@ -43,7 +46,7 @@ export default function Toolbar(props: Props) {
         <button className="btn" onClick={props.onExport}>
           导出 JSON
         </button>
-        <button className="btn" onClick={() => fileRef.current?.click()}>
+        <button className="btn" onClick={() => fileRef.current?.click()} disabled={locked} title={locked ? '冲突解决前不可导入' : undefined}>
           导入 JSON
         </button>
         <input
@@ -54,11 +57,13 @@ export default function Toolbar(props: Props) {
           onChange={(e) => void handleFile(e.target.files?.[0])}
         />
         <span className="divider" />
-        <button className="btn" onClick={props.onLoadDemo}>
+        <button className="btn" onClick={props.onLoadDemo} disabled={locked}>
           载入示例
         </button>
         <button
           className="btn danger"
+          disabled={locked}
+          title={locked ? '冲突解决前不可清空' : undefined}
           onClick={() => {
             if (window.confirm('确定清空当前规划？（可撤销）')) props.onReset();
           }}

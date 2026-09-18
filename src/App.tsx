@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Allocation,
   Plan,
@@ -17,6 +17,11 @@ import {
   planMigration,
 } from './lib/planner';
 import { cidrToString, parseCidr, prefixForHosts } from './lib/ip';
+import {
+  CHANNEL_NAME,
+  Revision,
+  RevisionSync,
+} from './lib/revisionStore';
 import Toolbar from './components/Toolbar';
 import RootsPanel from './components/RootsPanel';
 import TreeView from './components/TreeView';
@@ -24,6 +29,7 @@ import AllocationsPanel from './components/AllocationsPanel';
 import NewAllocationForm from './components/NewAllocationForm';
 import MigrationModal from './components/MigrationModal';
 import PrefixPolicyModal from './components/PrefixPolicyModal';
+import ConflictModal from './components/ConflictModal';
 
 interface MigrationRequest {
   title: string;
@@ -67,37 +73,124 @@ export default function App() {
   const [resizeTarget, setResizeTarget] = useState<Allocation | null>(null);
   const [prefixPolicyOpen, setPrefixPolicyOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<{ local: Revision; remote: Revision } | null>(null);
+  const [ready, setReady] = useState(false);
+
+  const syncRef = useRef<RevisionSync | null>(null);
+  const planRef = useRef<Plan>(plan);
+  planRef.current = plan;
+  const conflictRef = useRef(conflict);
+  conflictRef.current = conflict;
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
-    window.setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 5000);
+    window.setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 6000);
   }, []);
 
-  /** 所有状态变更的唯一入口：记录历史、清空重做栈 */
+  /** 所有状态变更的唯一入口：发布 revision、记录历史、清空重做栈。 */
   const commit = useCallback(
     (next: Plan) => {
-      setPast((p) => [...p, plan]);
+      const sync = syncRef.current;
+      if (sync?.inConflict) return; // 冲突期间禁止规划编辑
+      const current = planRef.current;
+      setPast((p) => [...p, current]);
       setFuture([]);
       setPlan(next);
+      planRef.current = next;
+      sync?.commit(next);
     },
-    [plan],
+    [],
   );
 
   const undo = useCallback(() => {
-    if (past.length === 0) return;
-    const prev = past[past.length - 1];
-    setPast(past.slice(0, -1));
-    setFuture((f) => [plan, ...f]);
-    setPlan(prev);
-  }, [past, plan]);
+    const sync = syncRef.current;
+    if (!sync || sync.inConflict) return;
+    setPast((p) => {
+      if (p.length === 0) return p;
+      const prev = p[p.length - 1];
+      const current = planRef.current;
+      setFuture((f) => [current, ...f]);
+      setPlan(prev);
+      planRef.current = prev;
+      sync.commit(prev); // 撤销同样发布为一个新修订
+      return p.slice(0, -1);
+    });
+  }, []);
 
   const redo = useCallback(() => {
-    if (future.length === 0) return;
-    const next = future[0];
-    setFuture(future.slice(1));
-    setPast((p) => [...p, plan]);
-    setPlan(next);
-  }, [future, plan]);
+    const sync = syncRef.current;
+    if (!sync || sync.inConflict) return;
+    setFuture((f) => {
+      if (f.length === 0) return f;
+      const next = f[0];
+      const current = planRef.current;
+      setPast((p) => [...p, current]);
+      setPlan(next);
+      planRef.current = next;
+      sync.commit(next); // 重做同样发布为一个新修订
+      return f.slice(1);
+    });
+  }, []);
+
+  // ---- 启动：恢复 head 修订并接入跨标签页广播 ----
+  useEffect(() => {
+    let storage: Storage | null = null;
+    try {
+      storage = window.localStorage;
+    } catch {
+      storage = null;
+    }
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(CHANNEL_NAME);
+    } catch {
+      channel = null;
+    }
+    const uuid = (): string =>
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `rev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    // clientId 必须按标签页隔离：存在共享 localStorage 会让所有标签页误判为同一客户端。
+    let clientId: string;
+    try {
+      clientId = window.sessionStorage.getItem('ipv4-subnet-planner/client-id') || uuid();
+      window.sessionStorage.setItem('ipv4-subnet-planner/client-id', clientId);
+    } catch {
+      clientId = uuid();
+    }
+
+    const sync = RevisionSync.open(
+      {
+        onFastForward: (rev) => {
+          // 外部更新可快进：作为一次可撤销变更并入本页历史。
+          const current = planRef.current;
+          setPast((p) => [...p, current]);
+          setFuture([]);
+          setPlan(rev.plan);
+          planRef.current = rev.plan;
+          setMigration(null); // 基于旧规划的待确认迁移已过期
+          setConflict(null); // 可能是冲突期间收到双父合并修订后的自动消解
+          showToast('已自动同步其他标签页的更新（可用撤销回到本页此前状态）');
+        },
+        onConflict: (rev) => {
+          setConflict({ local: sync.head, remote: rev });
+          setMigration(null);
+          showToast('检测到与其他标签页的分叉更新，请选择合并方式；冲突期间编辑已锁定');
+        },
+        onWarning: (msg) => showToast(msg),
+      },
+      { storage, channel, clientId, uuid },
+    );
+    syncRef.current = sync;
+    setPlan(sync.head.plan);
+    planRef.current = sync.head.plan;
+    setReady(true);
+
+    return () => {
+      sync.destroy();
+      syncRef.current = null;
+    };
+  }, [showToast]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -117,9 +210,36 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [undo, redo]);
 
+  /** 冲突解决：生成同时引用本地与外部两个版本的合并修订并继续广播。 */
+  const resolveConflict = useCallback(
+    (choice: 'local' | 'remote') => {
+      const sync = syncRef.current;
+      const cur = conflictRef.current;
+      if (!sync || !cur) return;
+      const current = planRef.current;
+      const chosen = choice === 'local' ? cur.local.plan : cur.remote.plan;
+      sync.mergeAndHead(chosen, cur.remote.id);
+      // 合并是一次显式变更：选择外部版本时合并前状态可一次撤销回来；
+      // 选择保留本页时内容未变（仅合并修订图），不入历史栈。
+      if (chosen !== current) {
+        setPast((p) => [...p, current]);
+        setFuture([]);
+        setPlan(chosen);
+        planRef.current = chosen;
+      }
+      setConflict(null);
+      showToast(choice === 'local' ? '已保留本页版本并合并修订图' : '已采用外部版本并合并修订图');
+      // 重新判定冲突期间挂起的其他外部修订（可能再次快进或再次冲突）。
+      sync.resume();
+    },
+    [showToast],
+  );
+
   /** 根网段或容量变更的统一入口：先预演，全部可保留则直接应用，否则弹窗确认 */
   const requestMigration = useCallback(
     (title: string, nextRoots: RootBlock[], nextAllocs: Allocation[]) => {
+      if (syncRef.current?.inConflict) return;
+      const plan = planRef.current;
       const mig = planMigration(nextRoots, nextAllocs);
       const next: Plan = {
         ...plan,
@@ -133,12 +253,13 @@ export default function App() {
         setMigration({ title, plan: mig, next });
       }
     },
-    [plan, commit, showToast],
+    [commit, showToast],
   );
 
   // ---- 根网段 ----
   const addRoot = useCallback(
     (name: string, cidr: string): string[] => {
+      const plan = planRef.current;
       const root: RootBlock = { id: newId('root'), name: name.trim(), cidr: cidr.trim() };
       const errors = validateRoots([...plan.roots, root]);
       if (errors.length > 0) return errors;
@@ -146,11 +267,12 @@ export default function App() {
       commit({ ...plan, roots: [...plan.roots, normalized] });
       return [];
     },
-    [plan, commit],
+    [commit],
   );
 
   const editRoot = useCallback(
     (id: string, name: string, cidr: string): string[] => {
+      const plan = planRef.current;
       const nextRoots = plan.roots.map((r) =>
         r.id === id ? { ...r, name: name.trim(), cidr: cidr.trim() } : r,
       );
@@ -163,22 +285,24 @@ export default function App() {
       requestMigration(`调整根网段「${name.trim()}」`, normalized, plan.allocations);
       return [];
     },
-    [plan, requestMigration],
+    [requestMigration],
   );
 
   const removeRoot = useCallback(
     (id: string) => {
+      const plan = planRef.current;
       const root = plan.roots.find((r) => r.id === id);
       if (!root) return;
       const nextRoots = plan.roots.filter((r) => r.id !== id);
       requestMigration(`删除根网段「${root.name}」(${root.cidr})`, nextRoots, plan.allocations);
     },
-    [plan, requestMigration],
+    [requestMigration],
   );
 
   // ---- 分配 ----
   const addReservation = useCallback(
     (name: string, cidr: string, note: string): string[] => {
+      const plan = planRef.current;
       const candidate = { name: name.trim(), cidr: cidr.trim() };
       const errors = validateAllocation(plan, candidate);
       if (errors.length > 0) return errors;
@@ -194,11 +318,12 @@ export default function App() {
       commit({ ...plan, allocations: [...plan.allocations, alloc] });
       return [];
     },
-    [plan, commit],
+    [commit],
   );
 
   const requestSubnet = useCallback(
     (name: string, hosts: number, rootId: string, note: string): string[] => {
+      const plan = planRef.current;
       const errors: string[] = [];
       if (!name.trim()) errors.push('名称不能为空');
       if (!Number.isInteger(hosts) || hosts < 1) errors.push('主机数必须为不小于 1 的整数');
@@ -229,19 +354,21 @@ export default function App() {
       commit({ ...plan, allocations: [...plan.allocations, alloc] });
       return [];
     },
-    [plan, commit],
+    [commit],
   );
 
   const releaseAllocation = useCallback(
     (id: string) => {
+      const plan = planRef.current;
       commit({ ...plan, allocations: plan.allocations.filter((a) => a.id !== id) });
       showToast('已释放，相邻空闲伙伴块已自动合并');
     },
-    [plan, commit, showToast],
+    [commit, showToast],
   );
 
   const resizeAllocation = useCallback(
     (id: string, hosts: number): string[] => {
+      const plan = planRef.current;
       const alloc = plan.allocations.find((a) => a.id === id);
       if (!alloc) return ['分配不存在'];
       if (!Number.isInteger(hosts) || hosts < 1) return ['主机数必须为不小于 1 的整数'];
@@ -256,19 +383,19 @@ export default function App() {
       );
       return [];
     },
-    [plan, requestMigration],
+    [requestMigration],
   );
 
   // ---- 导入导出 ----
   const exportPlan = useCallback(() => {
-    const blob = new Blob([serializePlan(plan)], { type: 'application/json' });
+    const blob = new Blob([serializePlan(planRef.current)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `subnet-plan-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [plan]);
+  }, []);
 
   const importPlan = useCallback(
     (text: string) => {
@@ -286,11 +413,14 @@ export default function App() {
   const loadDemo = useCallback(() => commit(demoPlan()), [commit]);
   const resetPlan = useCallback(() => commit(emptyPlan()), [commit]);
 
+  const locked = conflict !== null;
+
   return (
     <div className="app">
       <Toolbar
-        canUndo={past.length > 0}
-        canRedo={future.length > 0}
+        canUndo={past.length > 0 && !locked}
+        canRedo={future.length > 0 && !locked}
+        locked={locked}
         onUndo={undo}
         onRedo={redo}
         onExport={exportPlan}
@@ -308,7 +438,13 @@ export default function App() {
         </div>
       )}
 
-      <main className="layout">
+      {locked && (
+        <div className="lock-banner" role="status">
+          ⚠ 检测到其他标签页的分叉更新，冲突解决前规划编辑已锁定（仍可导出与执行只读校验）。
+        </div>
+      )}
+
+      <main className={`layout${locked ? ' locked' : ''}`} aria-busy={locked}>
         <aside className="sidebar">
           <RootsPanel
             roots={plan.roots}
@@ -339,7 +475,7 @@ export default function App() {
         </section>
       </main>
 
-      {resizeTarget && (
+      {resizeTarget && !locked && (
         <div className="modal-backdrop" onClick={() => setResizeTarget(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>调整容量：{resizeTarget.name}</h3>
@@ -354,7 +490,7 @@ export default function App() {
         </div>
       )}
 
-      {migration && (
+      {migration && !locked && (
         <MigrationModal
           title={migration.title}
           plan={migration.plan}
@@ -373,6 +509,17 @@ export default function App() {
           onClose={() => setPrefixPolicyOpen(false)}
         />
       )}
+
+      {conflict && (
+        <ConflictModal
+          local={conflict.local.plan}
+          remote={conflict.remote.plan}
+          onChooseLocal={() => resolveConflict('local')}
+          onChooseRemote={() => resolveConflict('remote')}
+        />
+      )}
+
+      {!ready && <div className="boot-veil">正在恢复本地规划…</div>}
     </div>
   );
 }
